@@ -27,7 +27,7 @@ def parse_uploaded_filename(name: str):
     as the integer take number.
     """
     p = Path(name)
-    stem = p.stem  # removes final extension
+    stem = p.stem
     m = FILENAME_RE.match(stem)
     if not m:
         return None
@@ -38,21 +38,18 @@ def parse_uploaded_filename(name: str):
 
 
 def stable_seed_for_line(line_key: str, take_ids_sorted: list[str]) -> int:
-    """Deterministic seed derived from line key + sorted take IDs."""
     payload = line_key + "|" + "|".join(take_ids_sorted)
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return int(h[:8], 16)  # 32-bit seed
 
 
 def init_state():
-    if "library" not in st.session_state:
-        st.session_state.library = {}  # take_id -> metadata + bytes
-    if "line_runs" not in st.session_state:
-        st.session_state.line_runs = {}  # line_key -> run state
+    st.session_state.setdefault("library", {})   # take_id -> metadata + bytes
+    st.session_state.setdefault("line_runs", {}) # line_key -> run state
+    st.session_state.setdefault("selected_line", None)
 
 
 def build_library_from_uploads(uploaded_files):
-    """Populate st.session_state.library from UploadedFile objects."""
     lib = {}
     errors = []
     for uf in uploaded_files:
@@ -90,7 +87,6 @@ def takes_by_line(library: dict):
 
 
 def ensure_line_run(line_key: str, take_ids: list[str]):
-    """Create the test list once per line and keep it stable."""
     runs = st.session_state.line_runs
     if line_key in runs:
         return
@@ -120,7 +116,6 @@ def record_vote(line_key: str, winner_take_id: str):
     run = st.session_state.line_runs[line_key]
     idx = run["idx"]
     a, b = run["tests"][idx]
-
     if winner_take_id not in (a, b):
         raise ValueError("Winner must be one of the current pair.")
 
@@ -176,10 +171,24 @@ def export_line_json(line_key: str):
     return json.dumps(payload, indent=2)
 
 
+def vote(side: str):
+    line_key = st.session_state.selected_line
+    run = st.session_state.line_runs[line_key]
+    idx = run["idx"]
+    a_id, b_id = run["tests"][idx]
+    winner = a_id if side == "A" else b_id
+    record_vote(line_key, winner)
+
+
+def back():
+    line_key = st.session_state.selected_line
+    undo_last_vote(line_key)
+
+
 st.set_page_config(page_title="Take Picker", layout="wide")
 init_state()
 
-st.title("Take Picker (A/B Comparisons)")
+st.title("Take Picker (Blind A/B Comparisons)")
 
 uploaded_files = st.file_uploader(
     "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.wav)",
@@ -200,11 +209,21 @@ if not st.session_state.library:
 by_line = takes_by_line(st.session_state.library)
 available_lines = sorted(by_line.keys())
 
-with st.sidebar:
-    st.header("Line Selection")
-    selected_line = st.selectbox("Choose a line", available_lines, index=0)
+# Main-page selector (not sidebar) so it's obvious on mobile.
+default_index = 0
+if st.session_state.selected_line in available_lines:
+    default_index = available_lines.index(st.session_state.selected_line)
 
+st.selectbox(
+    "Select line to compare",
+    available_lines,
+    index=default_index,
+    key="selected_line",
+)
+
+selected_line = st.session_state.selected_line
 take_ids_for_line = by_line[selected_line]
+
 if len(take_ids_for_line) < 2:
     st.warning("This line has fewer than 2 takes, so there are no comparisons to run.")
     st.stop()
@@ -214,7 +233,6 @@ run = st.session_state.line_runs[selected_line]
 total_tests = len(run["tests"])
 idx = run["idx"]
 
-st.write(f"Selected line: {selected_line}")
 st.write(f"Progress: Test {min(idx + 1, total_tests)} of {total_tests}")
 
 if idx >= total_tests:
@@ -222,8 +240,7 @@ if idx >= total_tests:
     st.table(ranking_table(selected_line))
 
     st.subheader("Head-to-Head Outcomes (Completed Tests)")
-    h2h = head_to_head_results(selected_line)
-    st.table(h2h if h2h else [{"Info": "No recorded outcomes."}])
+    st.table(head_to_head_results(selected_line))
 
     st.download_button(
         label="Download JSON Results for This Line",
@@ -241,30 +258,25 @@ col_a, col_b = st.columns(2)
 
 with col_a:
     st.subheader("A")
-    st.write(lib[a_id]["filename"])
     st.audio(lib[a_id]["bytes"], format=lib[a_id]["mime"])
 
 with col_b:
     st.subheader("B")
-    st.write(lib[b_id]["filename"])
     st.audio(lib[b_id]["bytes"], format=lib[b_id]["mime"])
 
 st.write("Which do you prefer?")
 
 btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
-
 with btn_col1:
-    if st.button("Prefer A", use_container_width=True):
-        record_vote(selected_line, a_id)
-
+    st.button("Prefer A", use_container_width=True, on_click=vote, args=("A",))
 with btn_col2:
-    if st.button("Prefer B", use_container_width=True):
-        record_vote(selected_line, b_id)
-
+    st.button("Prefer B", use_container_width=True, on_click=vote, args=("B",))
 with btn_col3:
-    if st.button("Back", disabled=(len(run["history"]) == 0), use_container_width=True):
-        undo_last_vote(selected_line)
+    st.button(
+        "Back",
+        use_container_width=True,
+        disabled=(len(run["history"]) == 0),
+        on_click=back,
+    )
 
-st.divider()
-st.subheader("Current Points (This Line)")
-st.table(ranking_table(selected_line))
+# Intentionally no score display during testing (blind + avoids early anchoring).
