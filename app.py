@@ -225,7 +225,7 @@ def load_zip_to_items(zip_bytes: bytes):
 
         ext = Path(base_name).suffix.lower()
         if ext not in ALLOWED_EXTS:
-            continue  # ignore non-audio
+            continue
 
         try:
             items.append((base_name, zf.read(info)))
@@ -288,16 +288,17 @@ if not available_lines:
     st.error("No valid lines were found in the uploaded files. Check filename format.")
     st.stop()
 
-prev = st.session_state.get("selected_line")
-default_index = available_lines.index(prev) if prev in available_lines else 0
+# Ensure stored selectbox value is always valid BEFORE rendering the widget.
+if st.session_state.selected_line not in available_lines:
+    st.session_state.selected_line = available_lines[0]
 
-selected_line = st.selectbox(
+st.selectbox(
     "Select line to compare",
     available_lines,
-    index=default_index,
+    key="selected_line",
 )
-st.session_state.selected_line = selected_line
 
+selected_line = st.session_state.selected_line
 take_ids_for_line = by_line.get(selected_line, [])
 if len(take_ids_for_line) < 2:
     st.warning("This line has fewer than 2 takes, so there are no comparisons to run.")
@@ -309,6 +310,13 @@ total_tests = len(run["tests"])
 idx = run["idx"]
 
 st.write(f"Progress: Test {min(idx + 1, total_tests)} of {total_tests}")
+
+# Optional: a manual "hard rerun" that can help after a stuck reconnect.
+col_r1, col_r2 = st.columns([1, 5])
+with col_r1:
+    st.button("Rerun", use_container_width=True, on_click=st.rerun)
+with col_r2:
+    st.caption("If the page gets stuck showing CONNECTING after returning to Safari, a manual rerun or refresh can recover the session, but mobile browsers may still drop WebSocket connections in the background.")
 
 if idx >= total_tests:
     st.subheader(f"{selected_line} Ranking (Points)")
