@@ -520,9 +520,7 @@ with st.expander("Import JSON backup (restore progress)", expanded=True):
     if st.session_state.persist_available is False and st.session_state.persist_last_error:
         st.warning(
             "Server-side auto-save is not available in this deployment (write failed). "
-            "Use the full-progress JSON download button at the bottom of the page frequently.
-
-"
+            "Use the full-progress JSON download button at the bottom of the page frequently.\n\n"
             f"Error: {st.session_state.persist_last_error}"
         )
 
