@@ -44,8 +44,8 @@ def stable_seed_for_line(line_key: str, take_ids_sorted: list[str]) -> int:
 
 
 def init_state():
-    st.session_state.setdefault("library", {})   # take_id -> metadata + bytes
-    st.session_state.setdefault("line_runs", {}) # line_key -> run state
+    st.session_state.setdefault("library", {})      # take_id -> metadata + bytes
+    st.session_state.setdefault("line_runs", {})    # line_key -> run state
     st.session_state.setdefault("selected_line", None)
 
 
@@ -209,21 +209,25 @@ if not st.session_state.library:
 by_line = takes_by_line(st.session_state.library)
 available_lines = sorted(by_line.keys())
 
-# Main-page selector (not sidebar) so it's obvious on mobile.
-default_index = 0
-if st.session_state.selected_line in available_lines:
-    default_index = available_lines.index(st.session_state.selected_line)
+if not available_lines:
+    st.error("No valid lines were found in the uploaded files. Check filename format.")
+    st.stop()
 
-st.selectbox(
+# Robust line selection:
+# If the previously selected line is no longer present, fall back to the first line.
+prev = st.session_state.get("selected_line")
+default_index = available_lines.index(prev) if prev in available_lines else 0
+
+selected_line = st.selectbox(
     "Select line to compare",
     available_lines,
     index=default_index,
-    key="selected_line",
 )
 
-selected_line = st.session_state.selected_line
-take_ids_for_line = by_line[selected_line]
+# Persist selection explicitly (no widget key, avoids option-change edge cases).
+st.session_state.selected_line = selected_line
 
+take_ids_for_line = by_line.get(selected_line, [])
 if len(take_ids_for_line) < 2:
     st.warning("This line has fewer than 2 takes, so there are no comparisons to run.")
     st.stop()
@@ -255,11 +259,9 @@ a_id, b_id = run["tests"][idx]
 lib = st.session_state.library
 
 col_a, col_b = st.columns(2)
-
 with col_a:
     st.subheader("A")
     st.audio(lib[a_id]["bytes"], format=lib[a_id]["mime"])
-
 with col_b:
     st.subheader("B")
     st.audio(lib[b_id]["bytes"], format=lib[b_id]["mime"])
@@ -279,4 +281,4 @@ with btn_col3:
         on_click=back,
     )
 
-# Intentionally no score display during testing (blind + avoids early anchoring).
+# Intentionally no score display during testing.
