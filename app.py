@@ -110,6 +110,20 @@ def build_library_from_name_bytes(file_items):
     return lib, errors
 
 
+def natural_sort_key(s: str):
+    """
+    Natural sort key: splits digits so 'Line2' < 'Line10'.
+    """
+    parts = re.split(r"(\d+)", s)
+    key = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        else:
+            key.append(p.casefold())
+    return key
+
+
 def takes_by_line(library: dict):
     by_line = {}
     for take_id, meta in library.items():
