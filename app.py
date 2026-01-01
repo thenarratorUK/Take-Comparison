@@ -659,6 +659,20 @@ if completed_line:
 
     st.table(rows)
 
+    # Next line navigation (natural sort order)
+    try:
+        current_idx = available_lines.index(selected_line)
+    except ValueError:
+        current_idx = -1
+
+    has_next = (current_idx >= 0 and current_idx < len(available_lines) - 1)
+    if has_next:
+        if st.button("Next line", use_container_width=True):
+            st.session_state.selected_line = available_lines[current_idx + 1]
+            st.rerun()
+    else:
+        st.caption("No next line (this is the last line in the list).")
+
 else:
     a_id, b_id = run["tests"][idx]
 if not completed_line:
