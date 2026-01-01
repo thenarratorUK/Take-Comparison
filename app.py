@@ -1,9 +1,11 @@
 import re
+import io
 import json
 import hashlib
 import random
 from pathlib import Path
 from itertools import combinations
+from zipfile import ZipFile, BadZipFile
 
 import streamlit as st
 
@@ -17,11 +19,16 @@ AUDIO_MIME_BY_EXT = {
     ".flac": "audio/flac",
 }
 
+ALLOWED_EXTS = set(AUDIO_MIME_BY_EXT.keys())
 FILENAME_RE = re.compile(r"^(?P<line>.+)\.(?P<take>\d+)$")
+
+# Safety guardrails for ZIP uploads.
+MAX_ZIP_UNCOMPRESSED_BYTES = 1_200_000_000  # 1.2 GB total extracted size
+MAX_ZIP_FILE_COUNT = 2_000
 
 
 def parse_uploaded_filename(name: str):
-    """Expect: <lineKey>.<takeNumber>.<extension>
+    """Expect: <lineKey>.<takeNumber>.<extension>.
 
     <lineKey> may contain dots. We interpret the last dot-separated stem component
     as the integer take number.
@@ -49,30 +56,32 @@ def init_state():
     st.session_state.setdefault("selected_line", None)
 
 
-def build_library_from_uploads(uploaded_files):
+def build_library_from_name_bytes(file_items):
+    """Build/extend library from iterable of (name, bytes)."""
     lib = {}
     errors = []
-    for uf in uploaded_files:
-        parsed = parse_uploaded_filename(uf.name)
+    for name, b in file_items:
+        parsed = parse_uploaded_filename(name)
         if not parsed:
-            errors.append(f"Unrecognised filename format: {uf.name}")
+            errors.append(f"Unrecognised filename format: {name}")
             continue
 
         line_key, take_num, ext = parsed
-        take_id = f"{line_key}.{take_num}"
+        if ext not in ALLOWED_EXTS:
+            errors.append(f"Unsupported audio extension: {name}")
+            continue
 
-        audio_bytes = uf.getvalue()
+        take_id = f"{line_key}.{take_num}"
         mime = AUDIO_MIME_BY_EXT.get(ext, "audio/wav")
 
         lib[take_id] = {
             "take_id": take_id,
             "line": line_key,
             "take_number": take_num,
-            "filename": uf.name,
-            "bytes": audio_bytes,
+            "filename": name,
+            "bytes": b,
             "mime": mime,
         }
-
     return lib, errors
 
 
@@ -99,7 +108,6 @@ def ensure_line_run(line_key: str, take_ids: list[str]):
     tests = []
     for a, b in unordered_pairs:
         tests.append((a, b) if rng.random() < 0.5 else (b, a))
-
     rng.shuffle(tests)
 
     runs[line_key] = {
@@ -185,22 +193,89 @@ def back():
     undo_last_vote(line_key)
 
 
+def load_zip_to_items(zip_bytes: bytes):
+    """Return (items, errors) where items is list[(basename, bytes)]."""
+    errors = []
+    items = []
+
+    try:
+        zf = ZipFile(io.BytesIO(zip_bytes))
+    except BadZipFile:
+        return [], ["Uploaded file is not a valid ZIP archive."]
+
+    infos = zf.infolist()
+
+    if len(infos) > MAX_ZIP_FILE_COUNT:
+        return [], [f"ZIP contains {len(infos)} entries; limit is {MAX_ZIP_FILE_COUNT}."]
+
+    total_uncompressed = sum(i.file_size for i in infos)
+    if total_uncompressed > MAX_ZIP_UNCOMPRESSED_BYTES:
+        mb = total_uncompressed / (1024 * 1024)
+        limit_mb = MAX_ZIP_UNCOMPRESSED_BYTES / (1024 * 1024)
+        return [], [f"ZIP uncompressed size is ~{mb:.1f} MB; limit is {limit_mb:.1f} MB."]
+
+    for info in infos:
+        if info.is_dir():
+            continue
+
+        base_name = Path(info.filename).name
+
+        if base_name in (".DS_Store",) or info.filename.startswith("__MACOSX/"):
+            continue
+
+        ext = Path(base_name).suffix.lower()
+        if ext not in ALLOWED_EXTS:
+            continue  # ignore non-audio
+
+        try:
+            items.append((base_name, zf.read(info)))
+        except Exception as e:
+            errors.append(f"Failed to read {info.filename}: {e}")
+
+    if not items:
+        errors.append("No supported audio files found inside the ZIP.")
+    return items, errors
+
+
 st.set_page_config(page_title="Take Picker", layout="wide")
 init_state()
 
 st.title("Take Picker (Blind A/B Comparisons)")
 
-uploaded_files = st.file_uploader(
-    "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.wav)",
-    accept_multiple_files=True,
-    type=["wav", "mp3", "m4a", "aac", "ogg", "flac"],
+upload_mode = st.radio(
+    "Upload method",
+    ["Multiple audio files", "ZIP archive of audio files"],
+    horizontal=True,
 )
 
-if uploaded_files:
-    new_lib, errors = build_library_from_uploads(uploaded_files)
-    if errors:
-        st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
-    st.session_state.library.update(new_lib)
+if upload_mode == "Multiple audio files":
+    uploaded_files = st.file_uploader(
+        "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.mp3)",
+        accept_multiple_files=True,
+        type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTS)],
+    )
+    if uploaded_files:
+        items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
+        new_lib, errors = build_library_from_name_bytes(items)
+        if errors:
+            st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
+        st.session_state.library.update(new_lib)
+
+else:
+    uploaded_zip = st.file_uploader(
+        "Upload a ZIP containing audio takes (filenames inside must be LineKey.takeNumber.ext)",
+        accept_multiple_files=False,
+        type=["zip"],
+    )
+    if uploaded_zip is not None:
+        items, zip_errors = load_zip_to_items(uploaded_zip.getvalue())
+        if zip_errors:
+            st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
+        if items:
+            new_lib, errors = build_library_from_name_bytes(items)
+            if errors:
+                st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
+            st.session_state.library.update(new_lib)
 
 if not st.session_state.library:
     st.info("Upload some audio files to begin.")
@@ -213,8 +288,6 @@ if not available_lines:
     st.error("No valid lines were found in the uploaded files. Check filename format.")
     st.stop()
 
-# Robust line selection:
-# If the previously selected line is no longer present, fall back to the first line.
 prev = st.session_state.get("selected_line")
 default_index = available_lines.index(prev) if prev in available_lines else 0
 
@@ -223,8 +296,6 @@ selected_line = st.selectbox(
     available_lines,
     index=default_index,
 )
-
-# Persist selection explicitly (no widget key, avoids option-change edge cases).
 st.session_state.selected_line = selected_line
 
 take_ids_for_line = by_line.get(selected_line, [])
