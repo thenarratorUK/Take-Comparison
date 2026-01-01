@@ -147,26 +147,6 @@ def undo_last_vote(line_key: str):
     run["idx"] = idx
 
 
-def ranking_table(line_key: str):
-    lib = st.session_state.library
-    run = st.session_state.line_runs[line_key]
-    rows = []
-    for tid, pts in run["scores"].items():
-        rows.append({"Take": tid, "Points": pts, "Filename": lib[tid]["filename"]})
-    rows.sort(key=lambda r: (-r["Points"], r["Take"]))
-    return rows
-
-
-def head_to_head_results(line_key: str):
-    run = st.session_state.line_runs[line_key]
-    out = []
-    for i, r in enumerate(run["results"]):
-        if r is None:
-            continue
-        out.append({"Test": i + 1, "A": r["a"], "B": r["b"], "Winner": r["winner"]})
-    return out
-
-
 def export_line_json(line_key: str):
     run = st.session_state.line_runs[line_key]
     payload = {
@@ -237,6 +217,113 @@ def load_zip_to_items(zip_bytes: bytes):
     return items, errors
 
 
+def build_head_to_head_map(line_key: str):
+    """Return dict[(low, high)] -> winner_take_id for completed line."""
+    run = st.session_state.line_runs[line_key]
+    h2h = {}
+    for r in run["results"]:
+        if r is None:
+            continue
+        a = r["a"]
+        b = r["b"]
+        key = tuple(sorted((a, b)))
+        h2h[key] = r["winner"]
+    return h2h
+
+
+def head_to_head_winner(h2h: dict, x: str, y: str):
+    key = tuple(sorted((x, y)))
+    return h2h.get(key)
+
+
+def mini_league_points(h2h: dict, group: list[str]):
+    """Return points within group, 1 point per head-to-head win."""
+    pts = {tid: 0 for tid in group}
+    for a, b in combinations(group, 2):
+        w = head_to_head_winner(h2h, a, b)
+        if w is None:
+            continue
+        pts[w] += 1
+    return pts
+
+
+def stable_fallback_order(seed: int, ids: list[str]) -> list[str]:
+    """Deterministic order used only if mini-league cannot separate 3+ items."""
+    rng = random.Random(seed ^ 0xA5A5A5A5)
+    ids2 = list(ids)
+    rng.shuffle(ids2)
+    return ids2
+
+
+def order_with_tiebreaks(line_key: str, take_ids: list[str]):
+    """Return:
+      - ordered list of take_ids for full line (points desc, then tiebreak within ties)
+      - tie_rank: dict[take_id] -> rank within its main-points group (1-based)
+
+    Tie-break logic for each points group:
+      - If 2 takes are tied: use head-to-head winner.
+      - If 3+ are tied: compute mini-league points within that tied group (1 point per win),
+        then resolve any remaining 2-way ties by head-to-head, and any remaining 3+ ties
+        by deterministic fallback order.
+    """
+    run = st.session_state.line_runs[line_key]
+    seed = run["seed"]
+    scores = run["scores"]
+    h2h = build_head_to_head_map(line_key)
+
+    groups = {}
+    for tid in take_ids:
+        groups.setdefault(scores[tid], []).append(tid)
+
+    ordered_points = sorted(groups.keys(), reverse=True)
+    final_order = []
+    tie_rank = {}
+
+    for pts in ordered_points:
+        members = groups[pts]
+        if len(members) == 1:
+            tid = members[0]
+            final_order.append(tid)
+            tie_rank[tid] = 1
+            continue
+
+        mini_pts = mini_league_points(h2h, members)
+
+        buckets = {}
+        for tid in members:
+            buckets.setdefault(mini_pts[tid], []).append(tid)
+
+        mini_points_desc = sorted(buckets.keys(), reverse=True)
+        rank_counter = 1
+
+        for mp in mini_points_desc:
+            sub = buckets[mp]
+            if len(sub) == 1:
+                tid = sub[0]
+                final_order.append(tid)
+                tie_rank[tid] = rank_counter
+                rank_counter += 1
+            elif len(sub) == 2:
+                x, y = sub[0], sub[1]
+                w = head_to_head_winner(h2h, x, y)
+                if w is None:
+                    ordered = sorted(sub)
+                else:
+                    ordered = [w, y if w == x else x]
+                for tid in ordered:
+                    final_order.append(tid)
+                    tie_rank[tid] = rank_counter
+                    rank_counter += 1
+            else:
+                ordered = stable_fallback_order(seed, sorted(sub))
+                for tid in ordered:
+                    final_order.append(tid)
+                    tie_rank[tid] = rank_counter
+                    rank_counter += 1
+
+    return final_order, tie_rank
+
+
 st.set_page_config(page_title="Take Picker", layout="wide")
 init_state()
 
@@ -288,7 +375,6 @@ if not available_lines:
     st.error("No valid lines were found in the uploaded files. Check filename format.")
     st.stop()
 
-# Ensure stored selectbox value is always valid BEFORE rendering the widget.
 if st.session_state.selected_line not in available_lines:
     st.session_state.selected_line = available_lines[0]
 
@@ -311,19 +397,27 @@ idx = run["idx"]
 
 st.write(f"Progress: Test {min(idx + 1, total_tests)} of {total_tests}")
 
-# Optional: a manual "hard rerun" that can help after a stuck reconnect.
 col_r1, col_r2 = st.columns([1, 5])
 with col_r1:
     st.button("Rerun", use_container_width=True, on_click=st.rerun)
 with col_r2:
-    st.caption("If the page gets stuck showing CONNECTING after returning to Safari, a manual rerun or refresh can recover the session, but mobile browsers may still drop WebSocket connections in the background.")
+    st.caption("If Safari gets stuck CONNECTING after returning from another app, refresh usually recovers. Mobile browsers may drop WebSocket connections while backgrounded.")
 
 if idx >= total_tests:
-    st.subheader(f"{selected_line} Ranking (Points)")
-    st.table(ranking_table(selected_line))
+    st.subheader(f"{selected_line} Ranking (with tie-break ranks)")
 
-    st.subheader("Head-to-Head Outcomes (Completed Tests)")
-    st.table(head_to_head_results(selected_line))
+    ordered, tie_rank = order_with_tiebreaks(selected_line, take_ids_for_line)
+
+    scores = run["scores"]
+    rows = []
+    for tid in ordered:
+        rows.append({
+            "Take": tid,
+            "Points": f"{scores[tid]}({tie_rank.get(tid, 1)})",
+            "Filename": st.session_state.library[tid]["filename"],
+        })
+
+    st.table(rows)
 
     st.download_button(
         label="Download JSON Results for This Line",
@@ -359,5 +453,3 @@ with btn_col3:
         disabled=(len(run["history"]) == 0),
         on_click=back,
     )
-
-# Intentionally no score display during testing.
