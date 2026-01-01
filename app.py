@@ -502,16 +502,7 @@ with top_row_a:
 with top_row_b:
     st.caption(f"User key: {st.session_state.user_key}")
 
-with st.expander("Progress backup / restore (recommended on iPhone)", expanded=False):
-    st.download_button(
-        "Download all progress (JSON backup)",
-        data=export_all_results_json(),
-        file_name="take_picker_results_all_lines.json",
-        mime="application/json",
-        use_container_width=True,
-        disabled=(len(st.session_state.line_runs) == 0),
-    )
-
+with st.expander("Import JSON backup (restore progress)", expanded=True):
     uploaded_results = st.file_uploader(
         "Import JSON backup (restores/overwrites line progress)",
         type=["json"],
@@ -529,7 +520,9 @@ with st.expander("Progress backup / restore (recommended on iPhone)", expanded=F
     if st.session_state.persist_available is False and st.session_state.persist_last_error:
         st.warning(
             "Server-side auto-save is not available in this deployment (write failed). "
-            "Use the JSON backup download frequently.\n\n"
+            "Use the full-progress JSON download button at the bottom of the page frequently.
+
+"
             f"Error: {st.session_state.persist_last_error}"
         )
 
@@ -574,6 +567,16 @@ else:
 
 if not st.session_state.library:
     st.info("Upload audio files to begin comparisons.")
+    st.divider()
+    st.subheader("Download all progress")
+    st.download_button(
+        "Download all progress (JSON)",
+        data=export_all_results_json(),
+        file_name="take_picker_results_all_lines.json",
+        mime="application/json",
+        use_container_width=True,
+        disabled=(len(st.session_state.line_runs) == 0),
+    )
     st.stop()
 
 st.divider()
@@ -614,53 +617,73 @@ st.caption(
     "re-upload the audio, then continue."
 )
 
-if idx >= total_tests:
+completed_line = idx >= total_tests
+
+if completed_line:
     st.subheader(f"{selected_line} Ranking (with tie-break ranks)")
 
     ordered, tie_rank = order_with_tiebreaks(selected_line, take_ids_for_line)
 
     scores = run["scores"]
     rows = []
+    # Only show tie-break ranks when there is an actual tie on points.
+    point_group_sizes = {}
+    for tid in take_ids_for_line:
+        p = scores[tid]
+        point_group_sizes[p] = point_group_sizes.get(p, 0) + 1
+
     for tid in ordered:
+        p = scores[tid]
+        if point_group_sizes.get(p, 0) > 1:
+            points_display = f"{p}({tie_rank.get(tid, 1)})"
+        else:
+            points_display = str(p)
+
         rows.append({
             "Take": tid,
-            "Points": f"{scores[tid]}({tie_rank.get(tid, 1)})",
+            "Points": points_display,
             "Filename": st.session_state.library[tid]["filename"],
         })
 
     st.table(rows)
 
-    st.download_button(
-        label="Download JSON Results for This Line",
-        data=export_line_json(selected_line),
-        file_name=f"{selected_line}_results.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    st.stop()
+else:
+    a_id, b_id = run["tests"][idx]
+if not completed_line:
+    lib = st.session_state.library
 
-a_id, b_id = run["tests"][idx]
-lib = st.session_state.library
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.subheader("A")
+        st.audio(lib[a_id]["bytes"], format=lib[a_id]["mime"])
+    with col_b:
+        st.subheader("B")
+        st.audio(lib[b_id]["bytes"], format=lib[b_id]["mime"])
 
-col_a, col_b = st.columns(2)
-with col_a:
-    st.subheader("A")
-    st.audio(lib[a_id]["bytes"], format=lib[a_id]["mime"])
-with col_b:
-    st.subheader("B")
-    st.audio(lib[b_id]["bytes"], format=lib[b_id]["mime"])
+    st.write("Which do you prefer?")
 
-st.write("Which do you prefer?")
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
+    with btn_col1:
+        st.button("Prefer A", use_container_width=True, on_click=vote, args=("A",))
+    with btn_col2:
+        st.button("Prefer B", use_container_width=True, on_click=vote, args=("B",))
+    with btn_col3:
+        st.button(
+            "Back",
+            use_container_width=True,
+            disabled=(len(run["history"]) == 0),
+            on_click=back,
+        )
 
-btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
-with btn_col1:
-    st.button("Prefer A", use_container_width=True, on_click=vote, args=("A",))
-with btn_col2:
-    st.button("Prefer B", use_container_width=True, on_click=vote, args=("B",))
-with btn_col3:
-    st.button(
-        "Back",
-        use_container_width=True,
-        disabled=(len(run["history"]) == 0),
-        on_click=back,
-    )
+st.divider()
+st.subheader("Download all progress")
+
+st.download_button(
+    "Download all progress (JSON)",
+    data=export_all_results_json(),
+    file_name="take_picker_results_all_lines.json",
+    mime="application/json",
+    use_container_width=True,
+    disabled=(len(st.session_state.line_runs) == 0),
+)
+
