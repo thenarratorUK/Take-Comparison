@@ -74,6 +74,7 @@ def init_state():
     st.session_state.setdefault("library", {})      # take_id -> metadata + bytes
     st.session_state.setdefault("line_runs", {})    # line_key -> run state
     st.session_state.setdefault("selected_line", None)
+    st.session_state.setdefault("upload_nonce", 0)
 
     # persistence status
     st.session_state.setdefault("persist_available", None)  # None=unknown, bool after first write
@@ -122,6 +123,25 @@ def natural_sort_key(s: str):
         else:
             key.append(p.casefold())
     return key
+
+
+def reset_for_new_upload():
+    """
+    Clear current audio + comparison state but keep the user key and stay on Step 2.
+    Intended for starting fresh with a different ZIP or set of files.
+    """
+    st.session_state["library"] = {}
+    st.session_state["line_runs"] = {}
+    st.session_state["selected_line"] = None
+    # Bump upload nonce to force file_uploader widgets to reset.
+    st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+
+
+def reset_everything():
+    """
+    Full reset back to Step 1 (clears user key too).
+    """
+    st.session_state.clear()
 
 
 def go_next_line(lines: list[str]):
@@ -527,10 +547,15 @@ if st.session_state.persist_loaded_msg:
     st.info(st.session_state.persist_loaded_msg)
     st.session_state.persist_loaded_msg = None
 
-top_row_a, top_row_b = st.columns([1, 1])
+top_row_a, top_row_b, top_row_c = st.columns([1, 1, 1])
+
 with top_row_a:
     st.button("Change user key", use_container_width=True, on_click=lambda: st.session_state.update({"step": 1}))
+
 with top_row_b:
+    st.button("Reset for new upload", use_container_width=True, on_click=reset_for_new_upload)
+
+with top_row_c:
     st.caption(f"User key: {st.session_state.user_key}")
 
 with st.expander("Import JSON backup (restore progress)", expanded=True):
@@ -570,6 +595,7 @@ if upload_mode == "Multiple audio files":
         "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.mp3)",
         accept_multiple_files=True,
         type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTS)],
+        key=f"audio_files_{st.session_state.upload_nonce}",
     )
     if uploaded_files:
         items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
@@ -583,6 +609,7 @@ else:
         "Upload a ZIP containing audio takes (filenames inside must be LineKey.takeNumber.ext)",
         accept_multiple_files=False,
         type=["zip"],
+        key=f"audio_zip_{st.session_state.upload_nonce}",
     )
     if uploaded_zip is not None:
         items, zip_errors = load_zip_to_items(uploaded_zip.getvalue())
