@@ -612,7 +612,7 @@ st.divider()
 st.subheader("Compare")
 
 by_line = takes_by_line(st.session_state.library)
-available_lines = sorted(by_line.keys())
+available_lines = sorted(by_line.keys(), key=natural_sort_key)
 
 if not available_lines:
     st.error("No valid lines were found in the uploaded files. Check filename format.")
