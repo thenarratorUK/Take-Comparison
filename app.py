@@ -684,8 +684,7 @@ if completed_line:
 
     has_next = (current_idx >= 0 and current_idx < len(available_lines) - 1)
     if has_next:
-        if st.button("Next line", use_container_width=True, on_click=go_next_line, args=(available_lines,)):
-        pass
+        st.button("Next line", use_container_width=True, on_click=go_next_line, args=(available_lines,))
     else:
         st.caption("No next line (this is the last line in the list).")
 
