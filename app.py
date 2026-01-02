@@ -124,6 +124,23 @@ def natural_sort_key(s: str):
     return key
 
 
+def go_next_line(lines: list[str]):
+    """
+    Advance the selectbox value to the next line.
+    Must be used as a widget callback (on_click), otherwise Streamlit can raise
+    an exception when changing a widget-backed session_state key.
+    """
+    cur = st.session_state.get("selected_line")
+    if not cur:
+        return
+    try:
+        i = lines.index(cur)
+    except ValueError:
+        return
+    if i < len(lines) - 1:
+        st.session_state["selected_line"] = lines[i + 1]
+
+
 def takes_by_line(library: dict):
     by_line = {}
     for take_id, meta in library.items():
@@ -667,9 +684,8 @@ if completed_line:
 
     has_next = (current_idx >= 0 and current_idx < len(available_lines) - 1)
     if has_next:
-        if st.button("Next line", use_container_width=True):
-            st.session_state.selected_line = available_lines[current_idx + 1]
-            st.rerun()
+        if st.button("Next line", use_container_width=True, on_click=go_next_line, args=(available_lines,)):
+        pass
     else:
         st.caption("No next line (this is the last line in the list).")
 
