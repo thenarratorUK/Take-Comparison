@@ -802,10 +802,7 @@ if upload_mode == "Multiple audio files":
             items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
             new_lib, errors = build_library_from_name_bytes(items)
             if errors:
-                st.error("Some files were ignored:
-
-" + "
-".join(f"- {e}" for e in errors))
+                st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
             st.session_state.library.update(new_lib)
             st.session_state.auto_pick_line = True
         else:
@@ -826,17 +823,11 @@ else:
             st.session_state.last_zip_sig = zip_sig
             items, zip_errors = load_zip_to_items(zip_bytes)
             if zip_errors:
-                st.error("ZIP issues:
-
-" + "
-".join(f"- {e}" for e in zip_errors))
+                st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
             if items:
                 new_lib, errors = build_library_from_name_bytes(items)
                 if errors:
-                    st.error("Some files were ignored:
-
-" + "
-".join(f"- {e}" for e in errors))
+                    st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
                 st.session_state.library.update(new_lib)
                 st.session_state.auto_pick_line = True
         else:
