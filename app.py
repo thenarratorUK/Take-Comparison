@@ -83,6 +83,8 @@ def init_state():
     st.session_state.setdefault("persist_loaded_msg", None)
     st.session_state.setdefault("persist_autoload_attempted", False)
     st.session_state.setdefault("auto_pick_line", True)
+    st.session_state.setdefault("last_files_sig", None)
+    st.session_state.setdefault("last_zip_sig", None)
 
 
 def build_library_from_name_bytes(file_items):
@@ -138,6 +140,8 @@ def reset_for_new_upload():
     st.session_state["deleted_by_line"] = {}
     # Bump upload nonce to force file_uploader widgets to reset.
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+    st.session_state["last_files_sig"] = None
+    st.session_state["last_zip_sig"] = None
     st.session_state["auto_pick_line"] = True
 
 
@@ -686,6 +690,27 @@ def user_changed_line():
     st.session_state["auto_pick_line"] = False
 
 
+def _files_signature(uploaded_files) -> tuple:
+    """
+    Stable signature for a set of uploaded files so we don't re-process on every rerun.
+    """
+    items = []
+    for f in uploaded_files:
+        try:
+            items.append((f.name, int(getattr(f, "size", 0))))
+        except Exception:
+            items.append((f.name, 0))
+    return ("files", tuple(sorted(items)))
+
+
+def _zip_signature(zip_bytes: bytes) -> tuple:
+    """
+    Signature for a zip payload (md5 + length).
+    """
+    h = hashlib.md5(zip_bytes).hexdigest()
+    return ("zip", h, len(zip_bytes))
+
+
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="Take Picker", layout="wide")
@@ -771,12 +796,21 @@ if upload_mode == "Multiple audio files":
         key=f"audio_files_{st.session_state.upload_nonce}",
     )
     if uploaded_files:
-        items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
-        new_lib, errors = build_library_from_name_bytes(items)
-        if errors:
-            st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
-        st.session_state.library.update(new_lib)
-        st.session_state.auto_pick_line = True
+        files_sig = _files_signature(uploaded_files)
+        if st.session_state.last_files_sig != files_sig:
+            st.session_state.last_files_sig = files_sig
+            items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
+            new_lib, errors = build_library_from_name_bytes(items)
+            if errors:
+                st.error("Some files were ignored:
+
+" + "
+".join(f"- {e}" for e in errors))
+            st.session_state.library.update(new_lib)
+            st.session_state.auto_pick_line = True
+        else:
+            # Same files as last rerun; do not reprocess.
+            pass
 
 else:
     uploaded_zip = st.file_uploader(
@@ -786,16 +820,28 @@ else:
         key=f"audio_zip_{st.session_state.upload_nonce}",
     )
     if uploaded_zip is not None:
-        items, zip_errors = load_zip_to_items(uploaded_zip.getvalue())
-        if zip_errors:
-            st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
-        if items:
-            new_lib, errors = build_library_from_name_bytes(items)
-            if errors:
-                st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
-            st.session_state.library.update(new_lib)
-            st.session_state.auto_pick_line = True
-        st.session_state.auto_pick_line = True
+        zip_bytes = uploaded_zip.getvalue()
+        zip_sig = _zip_signature(zip_bytes)
+        if st.session_state.last_zip_sig != zip_sig:
+            st.session_state.last_zip_sig = zip_sig
+            items, zip_errors = load_zip_to_items(zip_bytes)
+            if zip_errors:
+                st.error("ZIP issues:
+
+" + "
+".join(f"- {e}" for e in zip_errors))
+            if items:
+                new_lib, errors = build_library_from_name_bytes(items)
+                if errors:
+                    st.error("Some files were ignored:
+
+" + "
+".join(f"- {e}" for e in errors))
+                st.session_state.library.update(new_lib)
+                st.session_state.auto_pick_line = True
+        else:
+            # Same ZIP as last rerun; do not reprocess.
+            pass
 
 if not st.session_state.library:
     st.info("Upload audio files to begin comparisons.")
