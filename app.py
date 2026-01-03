@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import streamlit as st
 
 
-APP_RESULTS_VERSION = 2  # persistence format version
+APP_RESULTS_VERSION = 3  # persistence format version
 
 AUDIO_MIME_BY_EXT = {
     ".wav": "audio/wav",
@@ -74,6 +74,7 @@ def init_state():
     st.session_state.setdefault("library", {})      # take_id -> metadata + bytes
     st.session_state.setdefault("line_runs", {})    # line_key -> run state
     st.session_state.setdefault("selected_line", None)
+    st.session_state.setdefault("deleted_by_line", {})  # line_key -> set of deleted take_ids
     st.session_state.setdefault("upload_nonce", 0)
 
     # persistence status
@@ -133,6 +134,7 @@ def reset_for_new_upload():
     st.session_state["library"] = {}
     st.session_state["line_runs"] = {}
     st.session_state["selected_line"] = None
+    st.session_state["deleted_by_line"] = {}
     # Bump upload nonce to force file_uploader widgets to reset.
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
 
@@ -247,6 +249,9 @@ def export_all_results_obj():
             "idx": run["idx"],
             "history": run["history"],
         }
+    deleted_map = st.session_state.get("deleted_by_line", {})
+    for line_key, deleted in deleted_map.items():
+        payload["deleted_by_line"][line_key] = sorted(list(deleted))
     return payload
 
 
@@ -314,12 +319,19 @@ def _normalise_imported_run(line_key: str, run_obj: dict):
 def import_results_json(json_bytes: bytes):
     obj = json.loads(json_bytes.decode("utf-8"))
     version = obj.get("version", None)
-    if version != APP_RESULTS_VERSION:
+    if version not in (2, APP_RESULTS_VERSION):
         raise ValueError(f"Unsupported results JSON version: {version!r}")
 
     imported_runs = obj.get("line_runs")
     if not isinstance(imported_runs, dict):
         raise ValueError("Expected top-level key 'line_runs' to be a dict.")
+
+    # deleted_by_line is optional (version 2 backups won't have it)
+    deleted_in = obj.get("deleted_by_line", {})
+    if isinstance(deleted_in, dict):
+        st.session_state["deleted_by_line"] = {k: set(v) for k, v in deleted_in.items() if isinstance(v, list)}
+    else:
+        st.session_state["deleted_by_line"] = {}
 
     merged = 0
     for line_key, run_obj in imported_runs.items():
@@ -515,6 +527,135 @@ def order_with_tiebreaks(line_key: str, take_ids: list[str]):
     return final_order, tie_rank
 
 
+def active_take_ids_for_line(line_key: str, by_line: dict) -> list[str]:
+    deleted = st.session_state.get("deleted_by_line", {}).get(line_key, set())
+    return [tid for tid in by_line.get(line_key, []) if tid not in deleted]
+
+
+def delete_take_from_run(line_key: str, take_id_to_delete: str):
+    """
+    Remove a take from the current line run:
+    - removes all tests containing that take
+    - drops any completed results involving that take
+    - rebuilds scores/history/idx accordingly
+    """
+    run = st.session_state.line_runs.get(line_key)
+    if run is None:
+        return
+
+    tests = run["tests"]
+    results = run["results"]
+
+    keep_indices = [i for i, (a, b) in enumerate(tests) if take_id_to_delete not in (a, b)]
+
+    new_tests = [tests[i] for i in keep_indices]
+    new_results = [results[i] for i in keep_indices]
+
+    remaining = set()
+    for a, b in new_tests:
+        remaining.add(a)
+        remaining.add(b)
+
+    new_scores = {tid: 0 for tid in sorted(remaining)}
+    new_history = []
+    for i, r in enumerate(new_results):
+        if r is None:
+            continue
+        winner = r.get("winner")
+        if winner in new_scores:
+            new_scores[winner] += 1
+            new_history.append({"idx": i, "winner": winner})
+
+    new_idx = 0
+    for r in new_results:
+        if r is None:
+            break
+        new_idx += 1
+
+    run["tests"] = new_tests
+    run["results"] = new_results
+    run["scores"] = new_scores
+    run["history"] = new_history
+    run["idx"] = new_idx
+
+
+def delete_current_take(side: str):
+    """
+    Delete the currently presented A or B take from this line, then continue.
+    """
+    line_key = st.session_state.selected_line
+    run = st.session_state.line_runs.get(line_key)
+    if run is None:
+        return
+
+    if run["idx"] >= len(run["tests"]):
+        return
+
+    a_id, b_id = run["tests"][run["idx"]]
+    take_id = a_id if side == "A" else b_id
+
+    deleted_map = st.session_state.get("deleted_by_line", {})
+    deleted_map.setdefault(line_key, set()).add(take_id)
+    st.session_state["deleted_by_line"] = deleted_map
+
+    delete_take_from_run(line_key, take_id)
+
+    persist_save_best_effort()
+    st.rerun()
+
+
+def remaining_counts_for_line(line_key: str) -> dict[str, int]:
+    run = st.session_state.line_runs[line_key]
+    rem = {tid: 0 for tid in run["scores"].keys()}
+    for i in range(run["idx"], len(run["tests"])):
+        if run["results"][i] is not None:
+            continue
+        a, b = run["tests"][i]
+        if a in rem:
+            rem[a] += 1
+        if b in rem:
+            rem[b] += 1
+    return rem
+
+
+def clinched_leader(line_key: str):
+    """
+    Returns leader_take_id if the current leader cannot be overtaken on points.
+    Otherwise returns None.
+    """
+    run = st.session_state.line_runs[line_key]
+    scores = run["scores"]
+    if not scores:
+        return None
+
+    max_pts = max(scores.values())
+    leaders = [tid for tid, p in scores.items() if p == max_pts]
+    if len(leaders) != 1:
+        return None
+    leader = leaders[0]
+
+    rem = remaining_counts_for_line(line_key)
+    leader_pts = scores[leader]
+
+    for tid, p in scores.items():
+        if tid == leader:
+            continue
+        if p + rem.get(tid, 0) >= leader_pts:
+            return None
+
+    return leader
+
+
+def skip_remaining_tests():
+    line_key = st.session_state.selected_line
+    run = st.session_state.line_runs.get(line_key)
+    if run is None:
+        return
+    run["idx"] = len(run["tests"])
+    persist_save_best_effort()
+    st.rerun()
+
+
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="Take Picker", layout="wide")
@@ -655,7 +796,7 @@ st.selectbox(
 )
 
 selected_line = st.session_state.selected_line
-take_ids_for_line = by_line.get(selected_line, [])
+take_ids_for_line = active_take_ids_for_line(selected_line, by_line)
 if len(take_ids_for_line) < 2:
     st.warning("This line has fewer than 2 takes, so there are no comparisons to run.")
     st.stop()
@@ -667,6 +808,18 @@ total_tests = len(run["tests"])
 idx = run["idx"]
 
 st.write(f"Progress: Test {min(idx + 1, total_tests)} of {total_tests}")
+# Early-finish prompt (only for lines with > 8 takes)
+active_take_count = len(take_ids_for_line)
+if idx < total_tests and active_take_count > 8:
+    leader = clinched_leader(selected_line)
+    if leader is not None:
+        st.warning(
+            "A winner is already guaranteed on points for this line. "
+            "You can skip the remaining tests and go straight to results."
+        )
+        st.button("Skip to results", use_container_width=True, on_click=skip_remaining_tests)
+        st.caption("Continue testing if you still want fuller ranking detail among the remaining takes.")
+
 
 st.caption(
     "If iOS Safari drops the connection after backgrounding, refresh the page, re-enter your user key, "
@@ -742,6 +895,14 @@ if not completed_line:
             disabled=(len(run["history"]) == 0),
             on_click=back,
         )
+
+del_col1, del_col2, del_col3 = st.columns([1, 1, 1])
+with del_col1:
+    st.button("Delete A", use_container_width=True, on_click=delete_current_take, args=("A",))
+with del_col2:
+    st.button("Delete B", use_container_width=True, on_click=delete_current_take, args=("B",))
+with del_col3:
+    st.caption("Deletes remove this take from the line and drop any comparisons involving it.")
 
 st.divider()
 st.subheader("Download all progress")
