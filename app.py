@@ -76,6 +76,8 @@ def init_state():
     st.session_state.setdefault("selected_line", None)
     st.session_state.setdefault("deleted_by_line", {})  # line_key -> set of deleted take_ids
     st.session_state.setdefault("upload_nonce", 0)
+    st.session_state.setdefault("results_json_uploader_nonce", 0)
+    st.session_state.setdefault("results_json_clear_pending", False)
 
     # persistence status
     st.session_state.setdefault("persist_available", None)  # None=unknown, bool after first write
@@ -83,8 +85,6 @@ def init_state():
     st.session_state.setdefault("persist_loaded_msg", None)
     st.session_state.setdefault("persist_autoload_attempted", False)
     st.session_state.setdefault("auto_pick_line", True)
-    st.session_state.setdefault("last_files_sig", None)
-    st.session_state.setdefault("last_zip_sig", None)
 
 
 def build_library_from_name_bytes(file_items):
@@ -140,8 +140,6 @@ def reset_for_new_upload():
     st.session_state["deleted_by_line"] = {}
     # Bump upload nonce to force file_uploader widgets to reset.
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
-    st.session_state["last_files_sig"] = None
-    st.session_state["last_zip_sig"] = None
     st.session_state["auto_pick_line"] = True
 
 
@@ -256,6 +254,7 @@ def export_all_results_obj():
             "history": run["history"],
         }
     deleted_map = st.session_state.get("deleted_by_line", {})
+    payload.setdefault("deleted_by_line", {})
     for line_key, deleted in deleted_map.items():
         payload["deleted_by_line"][line_key] = sorted(list(deleted))
     return payload
@@ -690,27 +689,6 @@ def user_changed_line():
     st.session_state["auto_pick_line"] = False
 
 
-def _files_signature(uploaded_files) -> tuple:
-    """
-    Stable signature for a set of uploaded files so we don't re-process on every rerun.
-    """
-    items = []
-    for f in uploaded_files:
-        try:
-            items.append((f.name, int(getattr(f, "size", 0))))
-        except Exception:
-            items.append((f.name, 0))
-    return ("files", tuple(sorted(items)))
-
-
-def _zip_signature(zip_bytes: bytes) -> tuple:
-    """
-    Signature for a zip payload (md5 + length).
-    """
-    h = hashlib.md5(zip_bytes).hexdigest()
-    return ("zip", h, len(zip_bytes))
-
-
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="Take Picker", layout="wide")
@@ -760,13 +738,14 @@ with st.expander("Import JSON backup (restore progress)", expanded=True):
         "Import JSON backup (restores/overwrites line progress)",
         type=["json"],
         accept_multiple_files=False,
-        key="results_json_uploader_main",
+        key=f"results_json_uploader_main_{st.session_state.results_json_uploader_nonce}",
     )
     if uploaded_results is not None:
         try:
             merged = import_results_json(uploaded_results.getvalue())
             persist_save_best_effort()
             st.success(f"Imported {merged} line(s) from JSON backup.")
+            st.session_state.results_json_clear_pending = True
             st.session_state.auto_pick_line = True
         except Exception as e:
             st.error(f"Could not import results JSON: {e}")
@@ -796,18 +775,12 @@ if upload_mode == "Multiple audio files":
         key=f"audio_files_{st.session_state.upload_nonce}",
     )
     if uploaded_files:
-        files_sig = _files_signature(uploaded_files)
-        if st.session_state.last_files_sig != files_sig:
-            st.session_state.last_files_sig = files_sig
-            items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
-            new_lib, errors = build_library_from_name_bytes(items)
-            if errors:
-                st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
-            st.session_state.library.update(new_lib)
-            st.session_state.auto_pick_line = True
-        else:
-            # Same files as last rerun; do not reprocess.
-            pass
+        items = [(uf.name, uf.getvalue()) for uf in uploaded_files]
+        new_lib, errors = build_library_from_name_bytes(items)
+        if errors:
+            st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
+        st.session_state.library.update(new_lib)
+        st.session_state.auto_pick_line = True
 
 else:
     uploaded_zip = st.file_uploader(
@@ -817,22 +790,16 @@ else:
         key=f"audio_zip_{st.session_state.upload_nonce}",
     )
     if uploaded_zip is not None:
-        zip_bytes = uploaded_zip.getvalue()
-        zip_sig = _zip_signature(zip_bytes)
-        if st.session_state.last_zip_sig != zip_sig:
-            st.session_state.last_zip_sig = zip_sig
-            items, zip_errors = load_zip_to_items(zip_bytes)
-            if zip_errors:
-                st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
-            if items:
-                new_lib, errors = build_library_from_name_bytes(items)
-                if errors:
-                    st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
-                st.session_state.library.update(new_lib)
-                st.session_state.auto_pick_line = True
-        else:
-            # Same ZIP as last rerun; do not reprocess.
-            pass
+        items, zip_errors = load_zip_to_items(uploaded_zip.getvalue())
+        if zip_errors:
+            st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
+        if items:
+            new_lib, errors = build_library_from_name_bytes(items)
+            if errors:
+                st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
+            st.session_state.library.update(new_lib)
+            st.session_state.auto_pick_line = True
+        st.session_state.auto_pick_line = True
 
 if not st.session_state.library:
     st.info("Upload audio files to begin comparisons.")
@@ -867,6 +834,11 @@ if st.session_state.get("auto_pick_line", False):
     if target is not None:
         st.session_state.selected_line = target
     st.session_state.auto_pick_line = False
+    # Clear the uploaded JSON backup from the uploader after the auto-pick has run
+    # (prevents accidental re-import loops on reruns)
+    if st.session_state.get("results_json_clear_pending", False):
+        st.session_state.results_json_uploader_nonce = st.session_state.get("results_json_uploader_nonce", 0) + 1
+        st.session_state.results_json_clear_pending = False
 
 st.selectbox(
     "Select line to compare",
