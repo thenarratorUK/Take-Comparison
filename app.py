@@ -82,6 +82,7 @@ def init_state():
     st.session_state.setdefault("persist_last_error", None)
     st.session_state.setdefault("persist_loaded_msg", None)
     st.session_state.setdefault("persist_autoload_attempted", False)
+    st.session_state.setdefault("auto_pick_line", True)
 
 
 def build_library_from_name_bytes(file_items):
@@ -137,6 +138,7 @@ def reset_for_new_upload():
     st.session_state["deleted_by_line"] = {}
     # Bump upload nonce to force file_uploader widgets to reset.
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+    st.session_state["auto_pick_line"] = True
 
 
 def reset_everything():
@@ -656,6 +658,34 @@ def skip_remaining_tests():
     st.rerun()
 
 
+def first_incomplete_line(available_lines: list[str], by_line: dict) -> str | None:
+    """
+    Return the first line (natural order) that has >= 2 active takes AND is not complete.
+    Lines with < 2 active takes are skipped (no tests to run).
+    """
+    for line_key in available_lines:
+        active_ids = active_take_ids_for_line(line_key, by_line)
+        if len(active_ids) < 2:
+            continue
+
+        run = st.session_state.line_runs.get(line_key)
+        if run is None:
+            return line_key
+
+        # If run exists, consider it complete if idx >= len(tests)
+        try:
+            if int(run.get("idx", 0)) < len(run.get("tests", [])):
+                return line_key
+        except Exception:
+            return line_key
+
+    return None
+
+
+def user_changed_line():
+    st.session_state["auto_pick_line"] = False
+
+
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="Take Picker", layout="wide")
@@ -677,6 +707,7 @@ if st.session_state.step == 1:
         else:
             st.session_state.persist_loaded_msg = "No saved progress found for this key (starting fresh)."
         st.session_state.step = 2
+        st.session_state.auto_pick_line = True
         st.rerun()
 
     st.stop()
@@ -711,6 +742,7 @@ with st.expander("Import JSON backup (restore progress)", expanded=True):
             merged = import_results_json(uploaded_results.getvalue())
             persist_save_best_effort()
             st.success(f"Imported {merged} line(s) from JSON backup.")
+            st.session_state.auto_pick_line = True
         except Exception as e:
             st.error(f"Could not import results JSON: {e}")
 
@@ -744,6 +776,7 @@ if upload_mode == "Multiple audio files":
         if errors:
             st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
         st.session_state.library.update(new_lib)
+        st.session_state.auto_pick_line = True
 
 else:
     uploaded_zip = st.file_uploader(
@@ -761,6 +794,8 @@ else:
             if errors:
                 st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
             st.session_state.library.update(new_lib)
+            st.session_state.auto_pick_line = True
+        st.session_state.auto_pick_line = True
 
 if not st.session_state.library:
     st.info("Upload audio files to begin comparisons.")
@@ -789,16 +824,40 @@ if not available_lines:
 if st.session_state.selected_line not in available_lines:
     st.session_state.selected_line = available_lines[0]
 
+# Auto-jump to the first incomplete line after upload/restore (skips lines with <2 active takes)
+if st.session_state.get("auto_pick_line", False):
+    target = first_incomplete_line(available_lines, by_line)
+    if target is not None:
+        st.session_state.selected_line = target
+    st.session_state.auto_pick_line = False
+
 st.selectbox(
     "Select line to compare",
     available_lines,
     key="selected_line",
+    on_change=user_changed_line,
 )
 
 selected_line = st.session_state.selected_line
 take_ids_for_line = active_take_ids_for_line(selected_line, by_line)
 if len(take_ids_for_line) < 2:
-    st.warning("This line has fewer than 2 takes, so there are no comparisons to run.")
+    st.info("This line has fewer than 2 active takes, so there are no comparisons to run.")
+    if len(take_ids_for_line) == 1:
+        only_id = take_ids_for_line[0]
+        st.subheader("Listen")
+        st.audio(st.session_state.library[only_id]["bytes"], format=st.session_state.library[only_id]["mime"])
+    # Next line navigation
+    try:
+        current_idx = available_lines.index(selected_line)
+    except ValueError:
+        current_idx = -1
+
+    has_next = (current_idx >= 0 and current_idx < len(available_lines) - 1)
+    if has_next:
+        st.button("Next line", use_container_width=True, on_click=go_next_line, args=(available_lines,))
+    else:
+        st.caption("No next line (this is the last line in the list).")
+
     st.stop()
 
 ensure_line_run(selected_line, take_ids_for_line)
