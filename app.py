@@ -32,10 +32,22 @@ MAX_ZIP_FILE_COUNT = 2_000
 PERSIST_DIR = Path(".take_picker_persist")
 PERSIST_DIR.mkdir(exist_ok=True)
 
-
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def render_brand_header(logo_width_px: int = 200):
+    """Render the brand header (logo left, text right) if logo.png is present beside this script."""
+    left, middle, right = st.columns([1, 3, 1], vertical_alignment="center")
+
+    with left:
+        logo_path = Path(__file__).with_name("logo.png")
+        if logo_path.exists():
+            st.image(str(logo_path), width=logo_width_px)
+
+    with right:
+        st.markdown('Created by David Winter  \n("The Narrator")  \nhttps://www.thenarrator.co.uk')
+
+    st.markdown("---")
 
 def safe_key_hash(user_key: str) -> str:
     return hashlib.sha256(user_key.encode("utf-8")).hexdigest()
@@ -694,6 +706,7 @@ def user_changed_line():
 st.set_page_config(page_title="Take Picker", layout="wide")
 init_state()
 
+render_brand_header()
 st.title("Take Picker (Blind A/B Comparisons)")
 
 if st.session_state.step == 1:
