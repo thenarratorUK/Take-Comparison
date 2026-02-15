@@ -88,6 +88,7 @@ def init_state():
     st.session_state.setdefault("selected_line", None)
     st.session_state.setdefault("deleted_by_line", {})  # line_key -> set of deleted take_ids
     st.session_state.setdefault("upload_nonce", 0)
+    st.session_state.setdefault("last_zip_digest", None)
     st.session_state.setdefault("results_json_uploader_nonce", 0)
     st.session_state.setdefault("results_json_clear_pending", False)
 
@@ -222,19 +223,31 @@ def takes_by_line(library: dict):
     return by_line
 
 
+def _next_unfilled_idx(results: list) -> int:
+    for i, r in enumerate(results):
+        if r is None:
+            return i
+    return len(results)
+
+
 def ensure_line_run(line_key: str, take_ids: list[str]):
     """Ensure a run exists for this line.
 
-    If a run exists but its take_ids don't match current uploads, rebuild it.
+    If a run exists but the take set has changed (e.g. deletions), rebuild the test list
+    deterministically and carry over any still-valid completed comparisons.
     """
     runs = st.session_state.line_runs
     take_ids_sorted = sorted(take_ids)
 
-    if line_key in runs:
-        existing_ids = sorted(runs[line_key].get("scores", {}).keys())
-        if existing_ids == take_ids_sorted:
+    previous = runs.get(line_key)
+
+    if previous:
+        existing_ids = sorted(previous.get("scores", {}).keys())
+        if existing_ids == take_ids_sorted and previous.get("seed") == stable_seed_for_line(line_key, take_ids_sorted):
+            # Take set unchanged; ensure idx is aligned with results and keep existing ordering.
+            previous["idx"] = _next_unfilled_idx(previous.get("results", []))
+            runs[line_key] = previous
             return
-        runs.pop(line_key, None)
 
     seed = stable_seed_for_line(line_key, take_ids_sorted)
     rng = random.Random(seed)
@@ -245,19 +258,48 @@ def ensure_line_run(line_key: str, take_ids: list[str]):
         tests.append((a, b) if rng.random() < 0.5 else (b, a))
     rng.shuffle(tests)
 
-    runs[line_key] = {
+    # Build new empty run
+    new_run = {
         "seed": seed,
         "tests": tests,
-        "idx": 0,
+        "idx": 0,  # will be set below
         "scores": {tid: 0 for tid in take_ids_sorted},
         "history": [],  # stack of {"idx": int, "winner": take_id}
         "results": [None for _ in range(len(tests))],  # per-test outcome
     }
 
+    if previous:
+        # Carry over any completed comparisons whose takes are still present.
+        valid_ids = set(take_ids_sorted)
+        pair_to_winner = {}
+        for r in previous.get("results", []):
+            if not r:
+                continue
+            a = r.get("a")
+            b = r.get("b")
+            w = r.get("winner")
+            if not a or not b or not w:
+                continue
+            if a in valid_ids and b in valid_ids and w in valid_ids:
+                pair_to_winner[tuple(sorted((a, b)))] = w
+
+        for i, (a, b) in enumerate(tests):
+            w = pair_to_winner.get(tuple(sorted((a, b))))
+            if w is None:
+                continue
+            new_run["results"][i] = {"a": a, "b": b, "winner": w}
+            new_run["scores"][w] += 1
+            new_run["history"].append({"idx": i, "winner": w})
+
+    new_run["idx"] = _next_unfilled_idx(new_run["results"])
+    runs[line_key] = new_run
+
 
 def record_vote(line_key: str, winner_take_id: str):
     run = st.session_state.line_runs[line_key]
     idx = run["idx"]
+    if idx >= len(run["tests"]):
+        return
     a, b = run["tests"][idx]
     if winner_take_id not in (a, b):
         raise ValueError("Winner must be one of the current pair.")
@@ -265,7 +307,7 @@ def record_vote(line_key: str, winner_take_id: str):
     run["scores"][winner_take_id] += 1
     run["history"].append({"idx": idx, "winner": winner_take_id})
     run["results"][idx] = {"a": a, "b": b, "winner": winner_take_id}
-    run["idx"] += 1
+    run["idx"] = _next_unfilled_idx(run["results"])
 
 
 def undo_last_vote(line_key: str):
@@ -277,9 +319,9 @@ def undo_last_vote(line_key: str):
     idx = last["idx"]
     winner = last["winner"]
 
-    run["scores"][winner] -= 1
+    run["scores"][winner] = max(0, run["scores"][winner] - 1)
     run["results"][idx] = None
-    run["idx"] = idx
+    run["idx"] = _next_unfilled_idx(run["results"])
 
 
 def export_all_results_obj():
@@ -836,7 +878,13 @@ else:
         key=f"audio_zip_{st.session_state.upload_nonce}",
     )
     if uploaded_zip is not None:
-        items, zip_errors = load_zip_to_items(uploaded_zip.getvalue())
+        zip_bytes = uploaded_zip.getvalue()
+        zip_digest = hashlib.sha256(zip_bytes).hexdigest()
+        if st.session_state.last_zip_digest != zip_digest:
+            st.session_state.last_zip_digest = zip_digest
+            items, zip_errors = load_zip_to_items(zip_bytes)
+        else:
+            items, zip_errors = [], []
         if zip_errors:
             st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
         if items:
@@ -933,12 +981,13 @@ ensure_line_run(selected_line, take_ids_for_line)
 
 run = st.session_state.line_runs[selected_line]
 total_tests = len(run["tests"])
+completed_tests = sum(1 for r in run["results"] if r is not None)
 idx = run["idx"]
 
-st.write(f"Progress: Test {min(idx + 1, total_tests)} of {total_tests}")
+st.write(f"Progress: Test {min(completed_tests + 1, total_tests)} of {total_tests}")
 # Early-finish prompt (only for lines with > 8 takes)
 active_take_count = len(take_ids_for_line)
-if idx < total_tests and active_take_count > 8:
+if completed_tests < total_tests and active_take_count > 8:
     leader = clinched_leader(selected_line)
     if leader is not None:
         st.warning(
@@ -954,7 +1003,7 @@ st.caption(
     "re-upload the audio, then continue."
 )
 
-completed_line = idx >= total_tests
+completed_line = completed_tests >= total_tests
 
 if completed_line:
     st.subheader(f"{selected_line} Ranking (with tie-break ranks)")
