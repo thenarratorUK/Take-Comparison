@@ -90,6 +90,7 @@ def init_state():
     st.session_state.setdefault("upload_nonce", 0)
     st.session_state.setdefault("results_json_uploader_nonce", 0)
     st.session_state.setdefault("results_json_clear_pending", False)
+    st.session_state.setdefault("anon_lines", set())  # line_keys where takes are anonymised (ZIP fallback)
 
     # persistence status
     st.session_state.setdefault("persist_available", None)  # None=unknown, bool after first write
@@ -99,9 +100,63 @@ def init_state():
     st.session_state.setdefault("auto_pick_line", True)
 
 
-def build_library_from_name_bytes(file_items):
+def excel_style_label(index_zero_based: int) -> str:
+    """
+    0 -> A, 1 -> B, ... 25 -> Z, 26 -> AA, etc.
+    """
+    n = index_zero_based
+    label = ""
+    while True:
+        n, rem = divmod(n, 26)
+        label = chr(ord("A") + rem) + label
+        if n == 0:
+            break
+        n -= 1  # Excel-style carry
+    return label
+
+
+def build_library_from_name_bytes(file_items, *, force_single_line_key: str | None = None):
+    """
+    Build the take library from (filename, bytes) items.
+
+    Normal mode expects: LineKey.takeNumber.ext (lineKey may include dots).
+
+    ZIP fallback mode (force_single_line_key != None):
+      - All files are treated as belonging to the same line.
+      - Take numbers are assigned sequentially (1..N).
+      - Each take is given an anonymised label (A, B, C, ...).
+    """
     lib = {}
     errors = []
+
+    if force_single_line_key is not None:
+        # Keep deterministic ordering for consistent labels.
+        ordered = sorted(file_items, key=lambda x: x[0].casefold())
+        take_num = 0
+        for name, b in ordered:
+            p = Path(name)
+            ext = p.suffix.lower()
+            if ext not in ALLOWED_EXTS:
+                errors.append(f"Unsupported audio extension: {name}")
+                continue
+
+            take_num += 1
+            line_key = force_single_line_key
+            take_id = f"{line_key}.{take_num}"
+            mime = AUDIO_MIME_BY_EXT.get(ext, "audio/wav")
+
+            lib[take_id] = {
+                "take_id": take_id,
+                "line": line_key,
+                "take_number": take_num,
+                "filename": name,
+                "bytes": b,
+                "mime": mime,
+                "anon_label": excel_style_label(take_num - 1),
+            }
+        return lib, errors
+
+    # Normal filename parsing mode
     for name, b in file_items:
         parsed = parse_uploaded_filename(name)
         if not parsed:
@@ -123,6 +178,7 @@ def build_library_from_name_bytes(file_items):
             "filename": name,
             "bytes": b,
             "mime": mime,
+            "anon_label": None,
         }
     return lib, errors
 
@@ -150,6 +206,7 @@ def reset_for_new_upload():
     st.session_state["line_runs"] = {}
     st.session_state["selected_line"] = None
     st.session_state["deleted_by_line"] = {}
+    st.session_state["anon_lines"] = set()
     # Bump upload nonce to force file_uploader widgets to reset.
     st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
     st.session_state["auto_pick_line"] = True
@@ -782,7 +839,7 @@ upload_mode = st.radio(
 
 if upload_mode == "Multiple audio files":
     uploaded_files = st.file_uploader(
-        "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.mp3)",
+        "Upload audio takes (format: LineKey.takeNumber.ext, e.g. Line1.6.mp3). Alternatively, upload a zip file and all files will be compared with each other anonymously",
         accept_multiple_files=True,
         type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTS)],
         key=f"audio_files_{st.session_state.upload_nonce}",
@@ -797,7 +854,7 @@ if upload_mode == "Multiple audio files":
 
 else:
     uploaded_zip = st.file_uploader(
-        "Upload a ZIP containing audio takes (filenames inside must be LineKey.takeNumber.ext)",
+        "Upload a ZIP containing audio takes (filenames inside should be LineKey.takeNumber.ext). If any filenames do not match, all audio in the ZIP will be treated as one line and compared anonymously.",
         accept_multiple_files=False,
         type=["zip"],
         key=f"audio_zip_{st.session_state.upload_nonce}",
@@ -807,7 +864,23 @@ else:
         if zip_errors:
             st.error("ZIP issues:\n\n" + "\n".join(f"- {e}" for e in zip_errors))
         if items:
-            new_lib, errors = build_library_from_name_bytes(items)
+            # If any filenames in the ZIP don't match the expected format,
+            # treat the entire ZIP as a single anonymous line.
+            has_invalid_names = any(parse_uploaded_filename(n) is None for n, _b in items)
+
+            if has_invalid_names:
+                base_line = "ZIP"
+                line_key = base_line
+                suffix = 2
+                existing_lines = set(t["line"] for t in st.session_state.library.values())
+                while line_key in existing_lines:
+                    line_key = f"{base_line}_{suffix}"
+                    suffix += 1
+
+                new_lib, errors = build_library_from_name_bytes(items, force_single_line_key=line_key)
+                st.session_state.anon_lines.add(line_key)
+            else:
+                new_lib, errors = build_library_from_name_bytes(items)
             if errors:
                 st.error("Some files were ignored:\n\n" + "\n".join(f"- {e}" for e in errors))
             st.session_state.library.update(new_lib)
@@ -929,11 +1002,19 @@ if completed_line:
         else:
             points_display = str(p)
 
-        rows.append({
-            "Take": tid,
-            "Points": points_display,
-            "Filename": st.session_state.library[tid]["filename"],
-        })
+        if selected_line in st.session_state.anon_lines:
+            label = st.session_state.library[tid].get("anon_label") or tid
+            fname = st.session_state.library[tid]["filename"]
+            rows.append({
+                "Take": f"{label} ({fname})",
+                "Points": points_display,
+            })
+        else:
+            rows.append({
+                "Take": tid,
+                "Points": points_display,
+                "Filename": st.session_state.library[tid]["filename"],
+            })
 
     st.table(rows)
 
@@ -954,21 +1035,28 @@ else:
 if not completed_line:
     lib = st.session_state.library
 
+    is_anon = selected_line in st.session_state.anon_lines
+    left_label = lib[a_id].get("anon_label") if is_anon else "A"
+    right_label = lib[b_id].get("anon_label") if is_anon else "B"
+
+    if is_anon and left_label and right_label:
+        st.write(f"Comparing {left_label} vs {right_label}")
+
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("A")
+        st.subheader(left_label or "A")
         st.audio(lib[a_id]["bytes"], format=lib[a_id]["mime"])
     with col_b:
-        st.subheader("B")
+        st.subheader(right_label or "B")
         st.audio(lib[b_id]["bytes"], format=lib[b_id]["mime"])
 
     st.write("Which do you prefer?")
 
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
-        st.button("Prefer A", use_container_width=True, on_click=vote, args=("A",))
+        st.button(f"Prefer {left_label or 'A'}", use_container_width=True, on_click=vote, args=("A",))
     with btn_col2:
-        st.button("Prefer B", use_container_width=True, on_click=vote, args=("B",))
+        st.button(f"Prefer {right_label or 'B'}", use_container_width=True, on_click=vote, args=("B",))
     with btn_col3:
         st.button(
             "Back",
